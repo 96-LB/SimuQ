@@ -15,7 +15,6 @@ import logging
 import networkx as nx
 import numpy as np
 
-from simuq.expression import Expression
 from simuq.hamiltonian import TIHamiltonian, productHamiltonian
 
 logging.basicConfig(level=logging.CRITICAL)
@@ -98,70 +97,266 @@ def solve_aligned(
     global gtime
     global alignment
 
-    if solver == "least_squares":
-        
-        
-        import scipy.optimize as opt
-        
-        assert len(mach.gvars) == 0
-        assert not mach.with_sys_ham
-        assert len(qs.evos) == 1
-        
-        # first hamiltonian
-        ham, gtime = qs.evos[0]
-        targets = [(term, coefficient) for term, coefficient in ham.ham]
-        def _get(term):
-            for i in range(len(targets)):
-                if targets[i][0] == term:
-                    return targets.pop(i)[1]
-            return 0
-        
-        gsol = [None] * len(mach.lvars)
-        gswitch = []
-        
-        for line in mach.lines:
-            gswitch.append([])
-            for ins in line.inss:
-                switch = 0
-                eqns = []
-                vars = set()
-                for term, coefficient in ins.h.ham:
-                    target = _get(term)
-                    eqns.append((coefficient, target))
-                    vars = vars.union(coefficient.vars)
-                    if abs(target) > tol:
-                        switch = 1
-                vars = list(vars)
-                
-                gswitch[-1].append(switch)
-                if switch:
-                    map = {var: vars.index(var) for var in vars}
-                    
-                    def f(x):
-                        result = np.zeros(len(eqns))
-                        for i in range(len(eqns)):
-                            x_ = [x[map[v]] for v in eqns[i][0].vars]
-                            result[i] = eqns[i][0].exp(x_) - eqns[i][1]
-                        return result
-                    
-                    x = opt.root(f, np.zeros(len(vars)))
-                    if not x.success:
-                        raise Exception("Failed to solve the equation.")
-                    vals = x.x
+    def to_mprod(tprod):
+        ret = productHamiltonian()
+        for k in range(qs.num_sites):
+            ret[ali[k]] = tprod[k]
+        return ret
+
+    def is_id(tprod):
+        return tprod == productHamiltonian()
+
+    def build_eqs(fixed_values):
+        eqs = []
+        total_evo_num = len(qs.evos)
+        for evo_index in range(total_evo_num):
+            (h, t) = qs.evos[evo_index]
+            mark = [[0 for ins in line.inss] for line in mach.lines]
+            targ_terms = [(to_mprod(ham), c) for (ham, c) in h.ham]
+            targ_hash = set()
+            for tprod, tc in targ_terms:
+                targ_hash.add(tprod.to_tuple())
+            ind = 0
+            while ind < len(targ_terms):
+                tprod, tc = targ_terms[ind]
+                if is_id(tprod):
+                    ind += 1
+                    continue
+                if isinstance(tc, complex):
+                    if abs(tc.imag) > 1e-3:
+                        raise Exception("Met complex coefficients, not implemented yet.")
+                    tc = tc.real
+                eq = (lambda c: lambda x: -c)(tc * t)
+                for i in range(len(mach.lines)):
+                    line = mach.lines[i]
+                    for j in range(len(line.inss)):
+                        ins = line.inss[j]
+                        for mprod, mc in ins.h.ham:
+                            if tprod == mprod:  # This compares the contents of prodHams.
+                                eq = (lambda eq_, f_: lambda x: eq_(x) + f_(x))(
+                                    eq, ins_fun(mach, evo_index, ins.index, mc, total_evo_num)
+                                )
+                                mark[i][j] = 1
+                                # Check if other terms of machine instruction exists in targer Ham terms.
+                                for mprod_prime, _ in ins.h.ham:
+                                    mprod_prime_tup = mprod_prime.to_tuple()
+                                    if mprod_prime_tup not in targ_hash:
+                                        targ_terms.append((mprod_prime, 0))
+                                        targ_hash.add(mprod_prime_tup)
+                                break
+                eqs.append((lambda eq_: lambda x: eq_(x))(eq))
+                if verbose > 1:
+                    print(len(eqs))
+                ind += 1
+            for i in range(len(mach.lines)):
+                line = mach.lines[i]
+                for j in range(len(line.inss)):
+                    ins = line.inss[j]
+                    if ins.is_sys_ham:
+                        fixed_values[locate_switch(mach, evo_index, ins.index)] = 1
+                        if mark[i][j] == 0:
+                            line = mach.lines[-1]
+                            ins = line.inss[0]
+                            for mprod, mc in ins.h.ham:
+                                eqs.append(
+                                    (lambda eq_: lambda x: eq_(x))(
+                                        ins_fun(mach, evo_index, ins.index, mc, total_evo_num)
+                                    )
+                                )
+                    elif mark[i][j] == 0:
+                        fixed_values[locate_switch(mach, evo_index, ins.index)] = 0
+                        for lvar_index in ins.vars_index:
+                            fixed_values[locate_lvar(mach, evo_index, lvar_index)] = 0
+
+        return eqs, fixed_values
+
+    def build_obj(eqs, fixed_values):
+        lbs = []
+        ubs = []
+        init = []
+        map_var = []
+        map_var_revert = [None for _ in range(nvar)]
+        for i in range(nvar):
+            if fixed_values[i] is None:
+                map_var_revert[i] = len(map_var)
+                map_var.append(i)
+                if i < len(mach.gvars):
+                    ind = i
+                    lbs.append(mach.gvars[ind].lower_bound)
+                    ubs.append(mach.gvars[ind].upper_bound)
+                    init.append(mach.gvars[ind].init_value)
+                elif i >= len(mach.gvars) + len(qs.evos) * (len(mach.lvars) + mach.num_inss):
+                    lbs.append(0)
+                    ubs.append(np.inf)
+                    label = i - len(mach.gvars) - len(qs.evos) * (len(mach.lvars) + mach.num_inss)
+                    init.append(qs.evos[label][1])
+                elif (i - len(mach.gvars)) % (mach.num_inss + len(mach.lvars)) < mach.num_inss:
+                    lbs.append(0)
+                    ubs.append(1)
+                    init.append(0.5)
                 else:
-                    vals = np.zeros(len(vars))
-                
-                for i in range(len(vars)):
-                    if gsol[vars[i].index] is not None:
-                        raise Exception('uhhh')
-                    gsol[vars[i].index] = vals[i]
-        
+                    ind = (i - len(mach.gvars)) % (mach.num_inss + len(mach.lvars)) - mach.num_inss
+                    lbs.append(mach.lvars[ind].lower_bound)
+                    ubs.append(mach.lvars[ind].upper_bound)
+                    init.append(mach.lvars[ind].init_value)
+
+        def mapper(x, fixed_values, map_var_revert):
+            ret = []
+            for i in range(len(fixed_values)):
+                if fixed_values[i] is None:
+                    ret.append(x[map_var_revert[i]])
+                else:
+                    ret.append(fixed_values[i])
+            return ret
+
+        f = (
+            lambda eqs_, f_, m_, map_: lambda x: [
+                (lambda i_: eqs_[i_](map_(x, f_, m_)))(i) for i in range(len(eqs_))
+            ]
+        )(eqs, fixed_values, map_var_revert, mapper)
+
+        return f, lbs, ubs, init
+
+    def timevar_penalty(lamb=0.01):
+        eqs = []
+        for j in range(len(qs.evos)):
+            eqs.append(
+                (lambda lamb_, ind_, val_: lambda x: lamb_ * (x[ind_] - val_))(
+                    lamb, locate_timevar(mach, len(qs.evos), j), qs.evos[j][1]
+                )
+            )
+        return eqs
+
+    if solver == "least_squares":
+        # fix_time = True
+        logger.info("Using Scipy's Least Square Solver.")
+        import scipy.optimize as opt
+
+        nvar = len(mach.gvars) + len(qs.evos) * (mach.num_inss + len(mach.lvars)) + len(qs.evos)
+        eqs, fixed_values = build_eqs([None for i in range(nvar)])
+        # if fix_time :
+        #    for j in range(len(qs.evos)) :
+        #        fixed_values[locate_timevar(mach, len(qs.evos), j)] = qs.evos[j][1]
+        offset = np.sqrt(1e5 * tol / np.sqrt(nvar))
+        if verbose > 1 :
+            print("offset: ", offset)
+        # offset = 0
+        f, lbs, ubs, init = build_obj([lambda x: offset] + eqs, fixed_values)
+        if time_penalty != 0:
+            f_solve, _, _, _ = build_obj(
+                [lambda x: offset] + eqs + timevar_penalty(time_penalty), fixed_values
+            )
+        else:
+            f_solve = f
+
+        if verbose > 0:
+            print("#vars", nvar, "#eqs", len(eqs))
+            print("inits: ", init)
+            print("f_init:", f_solve(init))
+
+        import time
+
+        start_time = time.time()
+        sol_detail = opt.least_squares(
+            f_solve, init, bounds=(lbs, ubs), verbose=2 if verbose > 0 else 0
+        )
+        end_time = time.time()
+        if verbose > 0:
+            print("First round time: ", end_time - start_time)
+        logger.info("First round time: ", end_time - start_time)
+        sol = sol_detail.x
+
+        f_sol = f(sol)
+        sol_error = np.linalg.norm(f_sol[1:], 1)
+        logger.info(np.linalg.norm(f_sol[1:], 1))
+        if verbose > 0:
+            print("First round error: ", np.linalg.norm(f_sol[1:], 1))
+        if np.linalg.norm(f_sol[1:], 1) > tol:
+            return False
+
+        map_var = []
+        map_var_revert = [None for i in range(nvar)]
+        new_fixed_values = [fixed_values[i] for i in range(len(fixed_values))]
+        new_init = []
+        for i in range(nvar):
+            if fixed_values[i] is None:
+                label = len(map_var)
+                map_var_revert[i] = len(map_var)
+                map_var.append(i)
+                if (
+                    len(mach.gvars)
+                    <= i
+                    < len(mach.gvars) + len(qs.evos) * (len(mach.lvars) + mach.num_inss)
+                    and (i - len(mach.gvars)) % (mach.num_inss + len(mach.lvars)) < mach.num_inss
+                ):
+                    temp_store = sol[label]
+                    sol[label] = 0
+                    if np.linalg.norm(f(sol)[1:], 1) - sol_error > 1e-3:
+                        new_fixed_values[i] = 1
+                    else:
+                        new_fixed_values[i] = 0
+                    sol[label] = temp_store
+                else:
+                    new_init.append(sol[label])
+
+        eqs, fixed_values = build_eqs(new_fixed_values)
+        offset = np.sqrt(1e5 * tol / np.sqrt(len(new_init)))
+        f, lbs, ubs, _ = build_obj([lambda x: offset] + eqs, fixed_values)
+        if time_penalty != 0:
+            f_solve, _, _, _ = build_obj(
+                [lambda x: offset] + eqs + timevar_penalty(time_penalty), fixed_values
+            )
+        else:
+            f_solve = f
+
+        start_time = time.time()
+        sol_detail = opt.least_squares(
+            f_solve, new_init, bounds=(lbs, ubs), verbose=2 if verbose > 0 else 0
+        )
+        end_time = time.time()
+        if verbose > 0:
+            print("Second round time: ", end_time - start_time)
+        logger.info("Second round time: ", end_time - start_time)
+        sol = sol_detail.x
+
+        f_sol = f(sol)
+        sol_error = np.linalg.norm(f_sol[1:], 1)
+        logger.info(np.linalg.norm(f_sol[1:], 1))
+        if verbose > 0:
+            print("Second round error: ", np.linalg.norm(f_sol[1:], 1))
+        if np.linalg.norm(f_sol[1:], 1) > tol:
+            return False
+
         alignment = ali
+        gswitch = [
+            [
+                [fixed_values[locate_switch(mach, evo_index, ins.index)] for ins in line.inss]
+                for line in mach.lines
+            ]
+            for evo_index in range(len(qs.evos))
+        ]
+        gsol = []
+        gtime = []
+        map_var = []
+        for i in range(nvar):
+            value = fixed_values[i]
+            if fixed_values[i] is None:
+                value = sol[len(map_var)]
+                map_var.append(i)
+            if i >= len(mach.gvars) + len(qs.evos) * (len(mach.lvars) + mach.num_inss):
+                gtime.append(value)
+            elif (
+                i < len(mach.gvars)
+                or (i - len(mach.gvars)) % (mach.num_inss + len(mach.lvars)) >= mach.num_inss
+            ):
+                gsol.append(value)
+        for i in range(len(gsol)): gsol[i] = np.round(gsol[i], 3)
         gsol = np.array(gsol)
-        gtime = [gtime]
-        gswitch = [gswitch]
-        
+        print(gtime)
+        print(gsol)
+        print(gswitch)
         return True
+
     
     else :
         raise Exception("Solver does not exist.")
@@ -284,6 +479,7 @@ def generate_as(
     override_layout=None,
     verbose=0,
 ):
+    print('hello!')
     default_solver_args = {"tol": 1e-1, "with_time_penalty": False}
     solver_args = solver_args or default_solver_args
     if solver_tol is not None:
