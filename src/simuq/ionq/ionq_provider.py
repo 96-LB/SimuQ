@@ -26,6 +26,7 @@ class IonQProvider(BaseProvider):
         qs,
         backend="aria-1",
         aais="heisenberg",
+        solver="least_squares",
         tol=0.01,
         trotter_num=6,
         trotter_mode=1,
@@ -66,7 +67,7 @@ class IonQProvider(BaseProvider):
             qs,
             mach,
             trotter_args=trotter_args,
-            solver="least_squares",
+            solver=solver,
             solver_args={"tol": tol},
             override_layout=[i for i in range(qs.num_sites)],
             verbose=verbose,
@@ -86,7 +87,7 @@ class IonQProvider(BaseProvider):
 
         if meas_prep is not None:
             self.prog.add(meas_prep)
-
+        
         self.prog = self.prog.optimize()
         self.prog_obj = self.prog
         self.prog = self.prog.job
@@ -163,7 +164,7 @@ class IonQProvider(BaseProvider):
             while res["status"] != "completed":
                 time.sleep(wait)
                 response = requests.get("https://api.ionq.co/v0.2/jobs/" + job_id, headers=headers)
-                res = response.json()                
+                res = response.json()
 
         def layout_rev(res):
             n = len(self.layout)
@@ -178,5 +179,5 @@ class IonQProvider(BaseProvider):
             for key in data.keys():
                 ret[layout_rev(int(key))[-1::-1]] = data[key]
             return ret
-
+        #return res["data"]["histogram"]
         return results_from_data(res["data"]["histogram"])
